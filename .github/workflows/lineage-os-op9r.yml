@@ -1,0 +1,108 @@
+name: Build LineageOS OPlus SM8250 Kernel
+
+on:
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+  CLANG_VERSION: clang-r547379
+  Lineage_VERSION: lineage-23.2
+
+jobs:
+  build:
+    name: Build Kernel (${{ matrix.ks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ks: [rsuntk, backslashxx]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set swap to 10G
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 10
+
+    - name: Setup build environment
+      run: |
+        echo "BUILD_TIME=$(TZ=Asia/Shanghai date "+%y%m%d")" >> $GITHUB_ENV
+        echo "BUILD_TIME_1=$(TZ=Asia/Shanghai date "+%Y-%m-%d")" >> $GITHUB_ENV
+        sudo apt update
+        sudo apt install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool make squashfs-tools dpkg-dev libssl-dev python3 bc libc6-dev-i386 libncurses5-dev
+        mkdir -p kernel_workspace
+
+    - name: Cache Clang
+      uses: actions/cache@v4
+      with:
+        path: kernel_workspace/clang-aosp
+        key: ${{ env.CLANG_VERSION }}
+
+    - name: Download Clang (if not cached)
+      run: |
+        cd kernel_workspace
+        if [ ! -d clang-aosp ]; then
+          mkdir clang-aosp
+          wget -O ${CLANG_VERSION}.tar.gz \
+          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz
+          tar -C clang-aosp -zxvf ${CLANG_VERSION}.tar.gz
+        fi
+
+    - name: Clone Kernel Source
+      run: |
+        cd kernel_workspace
+        git clone --recursive https://github.com/LineageOS/android_kernel_oneplus_sm8250 -b ${{ env.Lineage_VERSION }} android-kernel --depth=1
+
+    - name: Setup KernelSU (${{ matrix.ks }})
+      run: |
+        cd kernel_workspace/android-kernel
+
+        if [ "${{ matrix.ks }}" = "rsuntk" ]; then
+          curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
+          RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
+          echo "KSUVER=$RSKSUVER" >> $GITHUB_ENV
+        else
+          curl -LSs https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh | bash -s master
+          echo "CONFIG_KSU_TAMPER_SYSCALL_TABLE=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
+          XXKSUVER=$(grep -oP 'KSU_VERSION\s*=\s*\K\d+' KernelSU/kernel/Makefile | tail -n1)
+          echo "KSUVER=$XXKSUVER" >> $GITHUB_ENV
+        fi
+
+    - name: Build Kernel
+      run: |
+        cd kernel_workspace/android-kernel
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$PATH
+
+        make O=out CC=clang LLVM=1 LD=ld.lld \
+        vendor/kona-perf_defconfig vendor/oplus.config
+
+        make -j$(nproc) O=out CC=clang LLVM=1 LD=ld.lld
+
+    - name: Package AnyKernel3
+      run: |
+        cd kernel_workspace
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+        cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
+        cd AnyKernel3
+
+        ZIPNAME=AK3-${{ env.Lineage_VERSION }}-OPlus-SM8250-${{ matrix.ks }}_KSU_${{ env.KSUVER }}.zip
+        zip -r $ZIPNAME ./*
+        echo "ZIPNAME=$ZIPNAME" >> $GITHUB_ENV
+
+    - name: Upload Release Asset
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ env.Lineage_VERSION }}
+        name: LineageOS ${{ env.Lineage_VERSION }} Kernel
+        body: |
+          Automated Kernel Build
+          Variant: ${{ matrix.ks }}
+          KernelSU Version: ${{ env.KSUVER }}
+          Build Date: ${{ env.BUILD_TIME_1 }}
+        files: kernel_workspace/AnyKernel3/${{ env.ZIPNAME }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
