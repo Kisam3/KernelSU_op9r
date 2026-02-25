@@ -1,0 +1,183 @@
+name: Build LineageOS OPlus SM8250 Kernel (With SuSFS)
+
+on:
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+  CLANG_VERSION: clang-r547379
+  LINEAGE_VERSION: lineage-23.2
+  KERNEL_ARCH: arm64
+  DEFCONFIG_NAME: vendor/kona-perf_defconfig
+  KERNEL_VERSION: 4.19
+  SUSFS_ENABLE: true
+  SUSFS_FIXED: false
+  BUILD_DEBUGGER: false
+
+jobs:
+  build:
+    name: Build Kernel (${{ matrix.ks }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ks: [rsuntk, backslashxx]
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set swap to 10G
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 10
+
+    - name: Setup build environment
+      run: |
+        echo "BUILD_TIME=$(date +%y%m%d)" >> $GITHUB_ENV
+        echo "BUILD_TIME_1=$(date +%Y-%m-%d)" >> $GITHUB_ENV
+        sudo apt-get update
+        sudo apt-get install -y \
+          git ccache automake flex lzop bison gperf build-essential \
+          zip curl zlib1g-dev g++-multilib bzip2 libbz2-dev liblz4-tool \
+          make squashfs-tools dpkg-dev libssl-dev python3 bc \
+          libc6-dev-i386 libncurses5-dev jq
+        mkdir -p kernel_workspace
+
+    # -----------------------------
+    # Toolchain
+    # -----------------------------
+    - name: Cache Clang
+      id: cache-clang
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/kernel_workspace/clang-aosp
+        key: ${{ env.CLANG_VERSION }}
+
+    - name: Download Clang (if needed)
+      if: steps.cache-clang.outputs.cache-hit != 'true'
+      run: |
+        cd kernel_workspace
+        mkdir clang-aosp
+        wget -O ${CLANG_VERSION}.tar.gz \
+          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz
+        tar -C clang-aosp -zxvf ${CLANG_VERSION}.tar.gz
+
+    # -----------------------------
+    # Kernel Source
+    # -----------------------------
+    - name: Clone Kernel Source
+      run: |
+        cd kernel_workspace
+        git clone --recursive \
+          https://github.com/LineageOS/android_kernel_oneplus_sm8250 \
+          -b ${{ env.LINEAGE_VERSION }} android-kernel --depth=1
+
+    # -----------------------------
+    # KernelSU Setup
+    # -----------------------------
+    - name: Setup KernelSU (${{ matrix.ks }})
+      run: |
+        cd kernel_workspace/android-kernel
+
+        if [ "${{ matrix.ks }}" = "rsuntk" ]; then
+          curl -LSs https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh | bash -s main
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
+          RSKSUVER=$(cd KernelSU && expr $(git rev-list --count HEAD) + 30000)
+          echo "RSKSUVER=$RSKSUVER" >> $GITHUB_ENV
+        else
+          curl -LSs https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh | bash -s master
+          echo "CONFIG_KSU_TAMPER_SYSCALL_TABLE=y" >> arch/arm64/configs/vendor/kona-perf_defconfig
+          XXKSUVER=$(grep -oP 'KSU_VERSION\s*=\s*\K\d+' KernelSU/kernel/Makefile | tail -n1)
+          echo "XXKSUVER=$XXKSUVER" >> $GITHUB_ENV
+        fi
+
+        sed -i 's/ -dirty//g' scripts/setlocalversion
+
+    # -----------------------------
+    # 🔥 SuSFS Patch
+    # -----------------------------
+    - name: Patch Kernel with SuSFS
+      uses: ./.github/actions/patch-susfs
+      env:
+        SUSFS_ENABLE: ${{ env.SUSFS_ENABLE }}
+        SUSFS_FIXED: ${{ env.SUSFS_FIXED }}
+        KERNEL_ARCH: ${{ env.KERNEL_ARCH }}
+        DEFCONFIG_NAME: ${{ env.DEFCONFIG_NAME }}
+        KERNEL_VERSION: ${{ env.KERNEL_VERSION }}
+        BUILD_DEBUGGER: ${{ env.BUILD_DEBUGGER }}
+
+    # -----------------------------
+    # Build
+    # -----------------------------
+    - name: Build Kernel (${{ matrix.ks }})
+      run: |
+        cd kernel_workspace/android-kernel
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/bin:$PATH
+        export KBUILD_BUILD_HOST=Github-Action
+        export KBUILD_BUILD_USER=${{ github.actor }}
+
+        DEFCONFIG="vendor/kona-perf_defconfig vendor/oplus.config"
+
+        make O=out CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          LD=ld.lld LLVM=1 \
+          $DEFCONFIG
+
+        make -j$(nproc --all) O=out CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          LD=ld.lld LLVM=1
+
+    - name: Verify Output
+      run: |
+        cd kernel_workspace/android-kernel/out
+        if [ -f arch/arm64/boot/Image ]; then
+          echo "CHECK_IMAGE=true" >> $GITHUB_ENV
+          echo "KERNEL_VERSION=$(cat include/config/kernel.release)" >> $GITHUB_ENV
+        else
+          echo "Kernel build failed!"
+          exit 1
+        fi
+
+    # -----------------------------
+    # AnyKernel3 Packaging (A/B Safe)
+    # -----------------------------
+    - name: Prepare AnyKernel3
+      run: |
+        cd kernel_workspace
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+        sed -i 's/BLOCK=.*/BLOCK=auto;/g' AnyKernel3/anykernel.sh
+        sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto;/g' AnyKernel3/anykernel.sh
+
+        rm -rf AnyKernel3/.git*
+        cp android-kernel/out/arch/arm64/boot/Image AnyKernel3/
+
+        cd AnyKernel3
+
+        if [ "${{ matrix.ks }}" = "rsuntk" ]; then
+          zip -r AK3-${{ env.LINEAGE_VERSION }}-9R-rsuntk_KSU_${{ env.RSKSUVER }}.zip ./*
+        else
+          zip -r AK3-${{ env.LINEAGE_VERSION }}-9R-backslashxx_KSU_${{ env.XXKSUVER }}.zip ./*
+        fi
+
+    # -----------------------------
+    # Upload
+    # -----------------------------
+    - name: Upload Image
+      if: env.CHECK_IMAGE == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Image-${{ matrix.ks }}
+        path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image
+
+    - name: Upload AnyKernel3 ZIP
+      uses: actions/upload-artifact@v4
+      with:
+        name: AK3-${{ matrix.ks }}
+        path: kernel_workspace/AnyKernel3/*.zip
